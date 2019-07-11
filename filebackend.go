@@ -250,7 +250,7 @@ func (s *FileBackend) shouldDelete(name string, keepHours int) bool {
 		fmt.Fprintf(os.Stderr, "parse datetime suffix failed, name: %v, err: %v", name, err)
 		return false
 	}
-	fileTime.Add(time.Duration(keepHours) * time.Hour)
+	fileTime = fileTime.Add(time.Duration(keepHours) * time.Hour)
 	removePoint := truncateToHour(s.getNowTime())
 	if fileTime.Before(removePoint) {
 		return true
