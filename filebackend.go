@@ -17,6 +17,7 @@ const (
 	defaultFlushInterval = time.Second * 3
 	defaultBufferSize    = 256 * 1024
 	datetimeSuffixLayout = "2006010215"
+	logFileSuffix        = ".log"
 )
 
 var (
@@ -24,7 +25,12 @@ var (
 )
 
 func init() {
-	regexp.MustCompile("(INFO|ERROR|WARNING|DEBUG|FATAL)\\.log\\.20[0-9]{8}")
+	names := make([]string, 0, len(levelNames))
+	for _, name := range levelNames {
+		names = append(names, name)
+	}
+	rotatedFilenamePattern = regexp.MustCompile(fmt.Sprintf(
+		"(%s)\\.log\\.20[0-9]{8}", strings.Join(names, "|")))
 }
 
 func truncateToHour(t time.Time) time.Time {
@@ -95,13 +101,11 @@ func NewFileBackend(dir string) (*FileBackend, error) {
 	fileBackend.rotatedFilenamePattern = rotatedFilenamePattern
 	fileBackend.getNowTime = time.Now
 
-	for i := 0; i < int(levelCount); i++ {
-		filepath := path.Join(dir, levelNames[i]+".log")
-		file, err := os.OpenFile(filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
+	for i := levelMin; i <= levelMax; i++ {
+		filepath := path.Join(dir, levelNames[i]+logFileSuffix)
+		if err := fileBackend.openSyncBufio(i, filepath); err != nil {
 			return nil, err
 		}
-		fileBackend.writer[i] = newSyncBufio(file, filepath, defaultBufferSize)
 	}
 
 	intervalLoop := func(f func(), d time.Duration) {
@@ -111,11 +115,20 @@ func NewFileBackend(dir string) (*FileBackend, error) {
 		}
 	}
 
-	go intervalLoop((&fileBackend).doFlush, fileBackend.flushInterval)
+	go intervalLoop((&fileBackend).Flush, fileBackend.flushInterval)
 	go intervalLoop((&fileBackend).doMonitorFiles, time.Second*5)
 	go intervalLoop((&fileBackend).doRotateByHour, time.Second*1)
 
 	return &fileBackend, nil
+}
+
+func (s *FileBackend) openSyncBufio(level Level, filepath string) error {
+	file, err := os.OpenFile(filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	s.writer[level] = newSyncBufio(file, filepath, defaultBufferSize)
+	return nil
 }
 
 func (s *FileBackend) SetRotateFile(rotateByHour bool, keepHours int) {
@@ -132,10 +145,6 @@ func (s *FileBackend) SetFlushInterval(t time.Duration) {
 	s.flushInterval = t
 }
 
-func (s *FileBackend) doFlush() {
-	s.Flush()
-}
-
 func (s *FileBackend) doRotateByHour() {
 	if !s.rotateByHour {
 		return
@@ -143,10 +152,12 @@ func (s *FileBackend) doRotateByHour() {
 
 	// rotate files
 	rotateTime := truncateToHour(s.getNowTime())
+	ru := rotateTime.Unix()
+	_ = ru
 	if rotateTime.Unix() > s.lastRotateTime {
-		for i := 0; i < int(levelCount); i++ {
+		for i := levelMin; i <= levelMax; i++ {
 			originalFilename := s.writer[i].filePath
-			newFilename := originalFilename + rotateTime.Format(datetimeSuffixLayout)
+			newFilename := originalFilename + "." + rotateTime.Format(datetimeSuffixLayout)
 			os.Rename(originalFilename, newFilename)
 		}
 	}
@@ -172,7 +183,11 @@ func (s *FileBackend) doRotateByHour() {
 }
 
 func (s *FileBackend) doMonitorFiles() {
-	for i := 0; i < int(levelCount); i++ {
+	for i := levelMin; i <= levelMax; i++ {
+		if s.writer[i] == nil {
+			continue
+		}
+
 		writer := s.writer[i]
 		filepath := writer.filePath
 		_, err := os.Stat(filepath)
@@ -183,21 +198,25 @@ func (s *FileBackend) doMonitorFiles() {
 			fmt.Fprintf(os.Stderr, "stat %s failed: %v", filepath, err)
 			return
 		}
-
-		s.mutex.Lock()
-		defer s.mutex.Unlock()
-		file, err := os.OpenFile(filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
+		lockerWrapper := func(level Level, filepath string) error {
+			s.mutex.Lock()
+			defer s.mutex.Unlock()
+			return s.openSyncBufio(level, filepath)
+		}
+		if err := lockerWrapper(i, filepath); err != nil {
 			fmt.Fprintf(os.Stderr, "open %s failed: %v", filepath, err)
 			return
 		}
 		writer.close()
-		s.writer[i] = newSyncBufio(file, filepath, defaultBufferSize)
 	}
 }
 
 func (s *FileBackend) flush() {
 	for i := 0; i < int(levelCount); i++ {
+		if s.writer[i] == nil {
+			continue
+		}
+
 		s.writer[i].flush()
 		s.writer[i].sync()
 	}
@@ -242,7 +261,7 @@ func (s *FileBackend) shouldDelete(name string, keepHours int) bool {
 func (s *FileBackend) Log(level Level, content []byte) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	if level >= 0 && level < levelCount {
+	if level >= levelMin && level <= levelMax {
 		s.writer[level].write(content)
 	} else {
 		fmt.Fprintf(os.Stderr, "invalid level: %v, content: %s", level, content)
