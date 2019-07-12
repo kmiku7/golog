@@ -252,7 +252,7 @@ func (s *FileBackend) shouldDelete(name string, keepHours int) bool {
 	}
 	fileTime = fileTime.Add(time.Duration(keepHours) * time.Hour)
 	removePoint := truncateToHour(s.getNowTime())
-	if fileTime.Before(removePoint) {
+	if !fileTime.After(removePoint) {
 		return true
 	}
 	return false
